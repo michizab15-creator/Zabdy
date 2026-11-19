@@ -27,10 +27,11 @@ No tiene dependencias externas (solo Node.js ≥ 18).
 |---|---|
 | `ADMIN_PASSWORD` | Contraseña del panel `/admin` (obligatoria para usar el panel). |
 | `SESSION_SECRET` | Firma de las sesiones. Si falta se genera una al arrancar. |
-| `DATA_DIR` | Carpeta donde se guarda `leads.json` (por defecto `./data`). |
+| `DATABASE_URL` | Conexión PostgreSQL. Si está definida, los prospectos se guardan ahí de forma permanente. |
+| `DATA_DIR` | Sin `DATABASE_URL`: carpeta donde se guarda `leads.json` (por defecto `./data`). |
 
 ## Despliegue
 
 Desplegado en Render como Web Service (ver `render.yaml`). Cada `git push` a `main` vuelve a desplegar.
 
-> Nota: en el plan gratuito de Render el disco no es persistente: los prospectos guardados se pierden al redesplegar o reiniciar el servicio. Exporta el CSV con regularidad, o agrega un disco persistente (plan de pago) y apunta `DATA_DIR` a él.
+> Almacenamiento: en Render los prospectos se guardan en PostgreSQL (`sapti-db`). La base gratuita de Render vence 30 días después de creada; para conservarla, súbela a un plan de pago o cambia `DATABASE_URL` a otro Postgres (Neon, Supabase, etc.). Sin `DATABASE_URL` se usa un archivo JSON local, que en Render no es permanente.

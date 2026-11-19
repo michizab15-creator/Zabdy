@@ -29,26 +29,87 @@ const MIME = {
 };
 
 // ---------- almacenamiento ----------
-fs.mkdirSync(DATA_DIR, { recursive: true });
-let leads = [];
-try {
-  leads = JSON.parse(fs.readFileSync(LEADS_FILE, 'utf8'));
-  if (!Array.isArray(leads)) leads = [];
-} catch { leads = []; }
-
-let writeQueued = false;
-function persist() {
-  if (writeQueued) return;
-  writeQueued = true;
-  setImmediate(() => {
-    writeQueued = false;
-    const tmp = LEADS_FILE + '.tmp';
-    fs.writeFile(tmp, JSON.stringify(leads, null, 2), (err) => {
-      if (err) return console.error('Error guardando leads', err);
-      fs.rename(tmp, LEADS_FILE, (e) => e && console.error('Error renombrando', e));
+// Con DATABASE_URL se usa PostgreSQL (permanente). Sin ella, un archivo JSON local.
+function fileStore() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  let leads = [];
+  try {
+    leads = JSON.parse(fs.readFileSync(LEADS_FILE, 'utf8'));
+    if (!Array.isArray(leads)) leads = [];
+  } catch { leads = []; }
+  let writeQueued = false;
+  function persist() {
+    if (writeQueued) return;
+    writeQueued = true;
+    setImmediate(() => {
+      writeQueued = false;
+      const tmp = LEADS_FILE + '.tmp';
+      fs.writeFile(tmp, JSON.stringify(leads, null, 2), (err) => {
+        if (err) return console.error('Error guardando leads', err);
+        fs.rename(tmp, LEADS_FILE, (e) => e && console.error('Error renombrando', e));
+      });
     });
-  });
+  }
+  return {
+    kind: 'archivo',
+    async init() {},
+    async list() { return leads; },
+    async add(lead) { leads.unshift(lead); persist(); },
+    async update(id, patch) {
+      const l = leads.find((x) => x.id === id);
+      if (!l) return null;
+      Object.assign(l, patch);
+      persist();
+      return l;
+    },
+    async remove(id) {
+      const i = leads.findIndex((x) => x.id === id);
+      if (i === -1) return false;
+      leads.splice(i, 1);
+      persist();
+      return true;
+    },
+  };
 }
+
+function pgStore(url) {
+  const { Pool } = require('pg');
+  // Hosts internos (p. ej. "dpg-xxx-a" en Render) o locales no usan SSL; hosts públicos sí.
+  const host = new URL(url).hostname;
+  const useSsl = process.env.PGSSL ? process.env.PGSSL === 'on' : host.includes('.') && host !== '127.0.0.1';
+  const pool = new Pool({
+    connectionString: url,
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
+    max: 5,
+  });
+  return {
+    kind: 'postgres',
+    async init() {
+      await pool.query(`CREATE TABLE IF NOT EXISTS leads (
+        id TEXT PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        data JSONB NOT NULL
+      )`);
+    },
+    async list() {
+      const r = await pool.query('SELECT data FROM leads ORDER BY created_at DESC');
+      return r.rows.map((x) => x.data);
+    },
+    async add(lead) {
+      await pool.query('INSERT INTO leads (id, created_at, data) VALUES ($1, $2, $3)', [lead.id, lead.createdAt, lead]);
+    },
+    async update(id, patch) {
+      const r = await pool.query('UPDATE leads SET data = data || $2::jsonb WHERE id = $1 RETURNING data', [id, JSON.stringify(patch)]);
+      return r.rows[0] ? r.rows[0].data : null;
+    },
+    async remove(id) {
+      const r = await pool.query('DELETE FROM leads WHERE id = $1', [id]);
+      return r.rowCount > 0;
+    },
+  };
+}
+
+const store = process.env.DATABASE_URL ? pgStore(process.env.DATABASE_URL) : fileStore();
 
 // ---------- utilidades ----------
 const SECURITY_HEADERS = {
@@ -162,7 +223,7 @@ async function handleApi(req, res, url) {
   const p = url.pathname;
   const m = req.method;
 
-  if (p === '/api/health') return send(res, 200, { ok: true });
+  if (p === '/api/health') return send(res, 200, { ok: true, storage: store.kind });
 
   if (p === '/api/leads' && m === 'POST') {
     if (rateLimited('lead:' + clientIp(req), 8, 15 * 60 * 1000)) {
@@ -200,8 +261,7 @@ async function handleApi(req, res, url) {
           : [],
       };
     }
-    leads.unshift(lead);
-    persist();
+    await store.add(lead);
     return send(res, 201, { ok: true });
   }
 
@@ -229,10 +289,10 @@ async function handleApi(req, res, url) {
   // ---- rutas protegidas ----
   if (!isAuthed(req)) return send(res, 401, { error: 'Inicia sesión.' });
 
-  if (p === '/api/leads' && m === 'GET') return send(res, 200, { leads, statuses: STATUSES });
+  if (p === '/api/leads' && m === 'GET') return send(res, 200, { leads: await store.list(), statuses: STATUSES, storage: store.kind });
 
   if (p === '/api/leads.csv' && m === 'GET') {
-    return send(res, 200, leadsToCsv(leads), {
+    return send(res, 200, leadsToCsv(await store.list()), {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': `attachment; filename="sapti-prospectos-${new Date().toISOString().slice(0, 10)}.csv"`,
     });
@@ -240,23 +300,22 @@ async function handleApi(req, res, url) {
 
   const match = p.match(/^\/api\/leads\/([0-9a-f-]{36})$/);
   if (match) {
-    const idx = leads.findIndex((l) => l.id === match[1]);
-    if (idx === -1) return send(res, 404, { error: 'No encontrado.' });
+    const id = match[1];
     if (m === 'PATCH') {
       let body;
       try { body = await readBody(req); } catch { return send(res, 400, { error: 'Solicitud inválida.' }); }
+      const patch = { updatedAt: new Date().toISOString() };
       if (body.status !== undefined) {
         if (!STATUSES.includes(body.status)) return send(res, 422, { error: 'Estado inválido.' });
-        leads[idx].status = body.status;
+        patch.status = body.status;
       }
-      if (body.notes !== undefined) leads[idx].notes = clean(body.notes, 5000);
-      leads[idx].updatedAt = new Date().toISOString();
-      persist();
-      return send(res, 200, { lead: leads[idx] });
+      if (body.notes !== undefined) patch.notes = clean(body.notes, 5000);
+      const lead = await store.update(id, patch);
+      if (!lead) return send(res, 404, { error: 'No encontrado.' });
+      return send(res, 200, { lead });
     }
     if (m === 'DELETE') {
-      leads.splice(idx, 1);
-      persist();
+      if (!(await store.remove(id))) return send(res, 404, { error: 'No encontrado.' });
       return send(res, 200, { ok: true });
     }
   }
@@ -301,4 +360,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Sapti escuchando en http://localhost:${PORT}`));
+store.init()
+  .then(() => server.listen(PORT, () => console.log(`Sapti escuchando en http://localhost:${PORT} (almacenamiento: ${store.kind})`)))
+  .catch((e) => { console.error('No se pudo iniciar el almacenamiento', e); process.exit(1); });
